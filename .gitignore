@@ -9,6 +9,7 @@
 # 仅忽略仓库根目录下的临时 test_*.py 脚本；tests/ 目录下的单元测试需要纳入版本控制。
 /test_*.py
 /test.sh
+run_analysis.sh
 
 # 本地评审与高级路由配置（可能包含敏感信息或临时分析产物）
 /.codex
@@ -59,6 +60,7 @@ env/
 **/.llm_usage_hmac_secret
 logs/
 reports/
+data_fallback/
 *.db
 *.sqlite
 *.sqlite3

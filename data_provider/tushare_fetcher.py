@@ -1167,12 +1167,12 @@ class TushareFetcher(BaseFetcher):
             ChipDistribution 对象（最新交易日的数据），获取失败返回 None
 
         """
-        if Path("/root/daily_stock_analysis/data_fallback/chips.json").exists():
-            fallback_chip = load_fallback_data(stock_code)
-            logger.info(f"[筹码分布] {stock_code} 日期={fallback_chip.date}: 获利比例={fallback_chip.profit_ratio:.1%}, "
-                        f"平均成本={fallback_chip.avg_cost}, 90%集中度={fallback_chip.concentration_90:.2%}, "
-                        f"70%集中度={fallback_chip.concentration_70:.2%}")
-            return fallback_chip
+        #if Path("/root/daily_stock_analysis/data_fallback/chips.json").exists():
+        #    fallback_chip = load_fallback_data(stock_code)
+        #    logger.info(f"[筹码分布] {stock_code} 日期={fallback_chip.date}: 获利比例={fallback_chip.profit_ratio:.1%}, "
+        #                f"平均成本={fallback_chip.avg_cost}, 90%集中度={fallback_chip.concentration_90:.2%}, "
+        #                f"70%集中度={fallback_chip.concentration_70:.2%}")
+        #    return fallback_chip
 
         if _is_us_code(stock_code):
             logger.warning(f"[Tushare] TushareFetcher 不支持美股 {stock_code} 的筹码分布")

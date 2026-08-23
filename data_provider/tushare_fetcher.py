@@ -1180,6 +1180,58 @@ class TushareFetcher(BaseFetcher):
             return None
         return df.sort_values("trade_date").reset_index(drop=True)
 
+    def get_stock_financials(self, stock_code: str, lookback_days: int = 400) -> Optional[Dict[str, pd.DataFrame]]:
+        """
+        获取个股财报数据 (ts.pro_api(): fina_indicator/income/cashflow/forecast/express/dividend)
+
+        覆盖基本面 bundle 中 growth / financial_report / forecast / quick / dividend
+        所需字段，相关接口均需要 2000 积分以上。任一接口失败只记录警告并省略该项，
+        全部失败或无数据时返回 None，由调用方回退 akshare 候选链。
+
+        仅支持 A 股个股；美股/港股/ETF 返回 None。dividend 接口不传日期区间（其
+        end_date 参数为分红年度等值过滤），全量拉取后由调用方按除息日过滤。
+
+        Args:
+            stock_code: 股票代码，如 '600519'、'000001'
+            lookback_days: 向前拉取的自然日窗口（覆盖年报/中报及 TTM 分红）
+
+        Returns:
+            {接口名: DataFrame（按 end_date 升序）}，无数据返回 None
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        if _is_us_code(stock_code) or _is_hk_market(stock_code) or _is_etf_code(stock_code):
+            return None
+
+        ts_code = self._convert_stock_code(stock_code)
+        china_now = self._get_china_now()
+        ts_end = china_now.strftime("%Y%m%d")
+        ts_start = (china_now - timedelta(days=lookback_days)).strftime("%Y%m%d")
+
+        frames: Dict[str, pd.DataFrame] = {}
+        for interface in ("fina_indicator", "income", "cashflow", "forecast", "express", "dividend"):
+            try:
+                logger.debug(f"调用 Tushare {interface}({ts_code}, {ts_start}, {ts_end})")
+                if interface == "dividend":
+                    # tushare dividend 的 end_date 参数是“分红年度”等值过滤而非日期区间，
+                    # 直接拉全量历史，由 _build_dividend_payload 按除息日过滤 TTM / 未来日期
+                    df = self._call_api_with_rate_limit(interface, ts_code=ts_code)
+                else:
+                    df = self._call_api_with_rate_limit(
+                        interface, ts_code=ts_code, start_date=ts_start, end_date=ts_end
+                    )
+            except Exception as exc:
+                logger.warning(f"Tushare {interface}({ts_code}) 获取失败，省略该接口: {exc}")
+                df = None
+            if df is None or df.empty or "end_date" not in df.columns:
+                continue
+            frames[interface] = df.sort_values("end_date").reset_index(drop=True)
+
+        if not frames:
+            return None
+        return frames
+
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据

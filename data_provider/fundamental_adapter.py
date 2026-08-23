@@ -237,6 +237,154 @@ def _build_dividend_payload(
     }
 
 
+def _latest_row_by_date(df: Optional[pd.DataFrame], date_col: str = "end_date") -> Optional[pd.Series]:
+    """返回日期列最新的行（YYYYMMDD 字符串按字典序 == 时间序）。"""
+    if df is None or df.empty or date_col not in df.columns:
+        return None
+    work = df.copy()
+    work[date_col] = work[date_col].astype(str)
+    work = work[work[date_col].str.fullmatch(r"\d{8}")].reset_index(drop=True)
+    if work.empty:
+        return None
+    return work.iloc[work[date_col].idxmax()]
+
+
+def _tushare_float(row: Optional[pd.Series], column: str) -> Optional[float]:
+    """从 tushare 行取数值，NaN / 空串按 None 处理，避免 float(nan) 污染下游。"""
+    if row is None or column not in row.index:
+        return None
+    value = row.get(column)
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return _safe_float(value)
+
+
+def _filter_consolidated(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """优先取合并报表口径（comp_type==1），无该列或不存在合并行时按原样返回。"""
+    if df is None or df.empty or "comp_type" not in df.columns:
+        return df
+    work = df[df["comp_type"].astype(str).str.strip() == "1"]
+    return work if not work.empty else df
+
+
+def build_financial_bundle_from_tushare(
+    frames: Dict[str, pd.DataFrame],
+    stock_code: str,
+) -> Dict[str, Any]:
+    """
+    将 Tushare 财报接口原始数据映射为与 akshare 口径一致的基本面 payload。
+
+    frames 键为 tushare 接口名（fina_indicator / income / cashflow / forecast /
+    express / dividend）。金额单位与 akshare 契约对齐（元），同比 / ROE / 毛利率
+    为百分比数值。growth / financial_report 均无有效值时返回空 payload，由调用
+    方回退 akshare 候选链。
+    """
+    result: Dict[str, Any] = {
+        "status": "not_supported",
+        "growth": {},
+        "earnings": {},
+        "source_chain": [],
+        "errors": [],
+    }
+
+    fina_row = _latest_row_by_date(frames.get("fina_indicator"))
+    inc_row = _latest_row_by_date(_filter_consolidated(frames.get("income")))
+    cash_row = _latest_row_by_date(_filter_consolidated(frames.get("cashflow")))
+
+    # Growth（财务指标）
+    growth_payload: Dict[str, Any] = {}
+    if fina_row is not None:
+        revenue_yoy = _tushare_float(fina_row, "or_yoy")  # 营业收入同比（%）
+        if revenue_yoy is None:
+            revenue_yoy = _tushare_float(fina_row, "tr_yoy")  # 营业总收入同比（%）
+        growth_payload = {
+            "revenue_yoy": revenue_yoy,
+            "net_profit_yoy": _tushare_float(fina_row, "netprofit_yoy"),
+            "roe": _tushare_float(fina_row, "roe"),
+            "gross_margin": _tushare_float(fina_row, "grossprofit_margin"),
+        }
+    if any(v is not None for v in growth_payload.values()):
+        result["growth"] = growth_payload
+        result["source_chain"].append("growth:tushare_fina_indicator")
+
+    # Financial report（利润表 + 现金流量表 + 财务指标）
+    financial_report_payload: Dict[str, Any] = {}
+    report_date = None
+    if fina_row is not None:
+        report_date = _normalize_report_date(fina_row.get("end_date"))
+    if inc_row is not None:
+        if report_date is None:
+            report_date = _normalize_report_date(inc_row.get("end_date"))
+        financial_report_payload["revenue"] = _tushare_float(inc_row, "total_revenue")
+        financial_report_payload["net_profit_parent"] = _tushare_float(inc_row, "n_income_attr_p")
+    if cash_row is not None:
+        financial_report_payload["operating_cash_flow"] = _tushare_float(cash_row, "n_cashflow_act")
+    if fina_row is not None:
+        financial_report_payload["roe"] = _tushare_float(fina_row, "roe")
+    financial_report_payload["report_date"] = report_date
+    if any(v is not None for v in financial_report_payload.values()):
+        result["earnings"]["financial_report"] = financial_report_payload
+        result["source_chain"].append("earnings_financial:tushare_financials")
+
+    # Earnings forecast（业绩预告）
+    forecast_row = _latest_row_by_date(frames.get("forecast"))
+    if forecast_row is not None:
+        forecast_type = _safe_str(forecast_row.get("type"))
+        forecast_summary = _safe_str(forecast_row.get("summary")) or _safe_str(forecast_row.get("change_reason"))
+        text = f"{forecast_type}：{forecast_summary}" if forecast_type and forecast_summary else (forecast_type or forecast_summary)
+        if text:
+            result["earnings"]["forecast_summary"] = text[:200]
+            result["source_chain"].append("earnings_forecast:tushare_forecast")
+
+    # Earnings quick report（业绩快报）
+    express_row = _latest_row_by_date(frames.get("express"))
+    if express_row is not None:
+        express_revenue = _tushare_float(express_row, "revenue")
+        if express_revenue is not None:
+            parts = [f"营业收入{express_revenue / 1e8:.2f}亿"]
+            net_income = _tushare_float(express_row, "n_income")
+            if net_income is not None:
+                parts.append(f"净利润{net_income / 1e8:.2f}亿")
+            yoy_net_profit = _tushare_float(express_row, "yoy_net_profit")
+            if yoy_net_profit is not None:
+                parts.append(f"净利润同比{yoy_net_profit:.2f}%")
+            perf_summary = _safe_str(express_row.get("perf_summary"))
+            text = f"业绩快报：{'，'.join(parts)}"
+            if perf_summary:
+                text += f"（{perf_summary}）"
+            result["earnings"]["quick_report_summary"] = text[:200]
+            result["source_chain"].append("earnings_quick:tushare_express")
+
+    # Dividend（分红送配，复用 akshare 分红 payload 构建逻辑）
+    dividend_df = frames.get("dividend")
+    if dividend_df is not None and not dividend_df.empty:
+        rows: List[Dict[str, Any]] = []
+        for _, row in dividend_df.iterrows():
+            ex_date = _safe_str(row.get("ex_date"))
+            cash_div_tax = _tushare_float(row, "cash_div_tax")  # 每股派息税前（元/股）
+            if not ex_date or cash_div_tax is None or cash_div_tax <= 0:
+                continue
+            rows.append({
+                "股票代码": stock_code,
+                "除息日": ex_date,
+                "分配方案": f"每股派{cash_div_tax}元(含税)",
+            })
+        if rows:
+            dividend_payload = _build_dividend_payload(pd.DataFrame(rows), stock_code, max_events=5)
+            if dividend_payload:
+                result["earnings"]["dividend"] = dividend_payload
+                result["source_chain"].append("dividend:tushare_dividend")
+
+    has_content = bool(result["growth"] or result["earnings"])
+    result["status"] = "partial" if has_content else "not_supported"
+    return result
+
+
 def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
@@ -289,9 +437,18 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_fundamental_bundle(
+        self,
+        stock_code: str,
+        financial_bundle: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Return normalized fundamental blocks from AkShare with partial tolerance.
+        Return normalized fundamental blocks with partial tolerance.
+
+        financial_bundle: 预取的财报 payload（当前来自 Tushare fina_indicator/income/
+        cashflow/forecast/express/dividend），字段与 akshare 口径对齐。growth 或
+        financial_report 非空时跳过 akshare 财报候选链；机构/十大股东仍走 akshare
+        （fail-open）。为 None 或核心财报为空时按原有 akshare 候选链获取。
         """
         result: Dict[str, Any] = {
             "status": "not_supported",
@@ -302,85 +459,99 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        # Financial indicators
-        fin_df, fin_source, fin_errors = self._call_df_candidates([
-            ("stock_financial_abstract", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {}),
-        ])
-        result["errors"].extend(fin_errors)
-        if fin_df is not None:
-            row = _extract_latest_row(fin_df, stock_code)
-            if row is not None:
-                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
-                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
-                roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
-                gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
-                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]))
-                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
-                net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
-                operating_cash_flow = _safe_float(
-                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
-                )
-                result["growth"] = {
-                    "revenue_yoy": revenue_yoy,
-                    "net_profit_yoy": profit_yoy,
-                    "roe": roe,
-                    "gross_margin": gross_margin,
-                }
-                financial_report_payload = {
-                    "report_date": report_date,
-                    "revenue": revenue,
-                    "net_profit_parent": net_profit_parent,
-                    "operating_cash_flow": operating_cash_flow,
-                    "roe": roe,
-                }
-                if any(v is not None for v in financial_report_payload.values()):
-                    result["earnings"]["financial_report"] = financial_report_payload
-                result["source_chain"].append(f"growth:{fin_source}")
+        use_tushare = bool(
+            isinstance(financial_bundle, dict)
+            and (
+                financial_bundle.get("growth")
+                or (financial_bundle.get("earnings") or {}).get("financial_report")
+            )
+        )
+        if use_tushare:
+            tushare_earnings = financial_bundle.get("earnings")
+            result["growth"] = dict(financial_bundle.get("growth") or {})
+            result["earnings"] = dict(tushare_earnings) if isinstance(tushare_earnings, dict) else {}
+            result["source_chain"].extend(list(financial_bundle.get("source_chain") or []))
+            result["errors"].extend(list(financial_bundle.get("errors") or []))
+        else:
+            # Financial indicators
+            fin_df, fin_source, fin_errors = self._call_df_candidates([
+                ("stock_financial_abstract", {"symbol": stock_code}),
+                ("stock_financial_analysis_indicator", {"symbol": stock_code}),
+                ("stock_financial_analysis_indicator", {}),
+            ])
+            result["errors"].extend(fin_errors)
+            if fin_df is not None:
+                row = _extract_latest_row(fin_df, stock_code)
+                if row is not None:
+                    revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
+                    profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
+                    roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
+                    gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
+                    report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]))
+                    revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
+                    net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
+                    operating_cash_flow = _safe_float(
+                        _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
+                    )
+                    result["growth"] = {
+                        "revenue_yoy": revenue_yoy,
+                        "net_profit_yoy": profit_yoy,
+                        "roe": roe,
+                        "gross_margin": gross_margin,
+                    }
+                    financial_report_payload = {
+                        "report_date": report_date,
+                        "revenue": revenue,
+                        "net_profit_parent": net_profit_parent,
+                        "operating_cash_flow": operating_cash_flow,
+                        "roe": roe,
+                    }
+                    if any(v is not None for v in financial_report_payload.values()):
+                        result["earnings"]["financial_report"] = financial_report_payload
+                    result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast
-        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
-            ("stock_yjbb_em", {}),
-        ])
-        result["errors"].extend(forecast_errors)
-        if forecast_df is not None:
-            row = _extract_latest_row(forecast_df, stock_code)
-            if row is not None:
-                result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
-                )[:200]
-                result["source_chain"].append(f"earnings_forecast:{forecast_source}")
+            # Earnings forecast
+            forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
+                ("stock_yjyg_em", {"symbol": stock_code}),
+                ("stock_yjyg_em", {}),
+                ("stock_yjbb_em", {"symbol": stock_code}),
+                ("stock_yjbb_em", {}),
+            ])
+            result["errors"].extend(forecast_errors)
+            if forecast_df is not None:
+                row = _extract_latest_row(forecast_df, stock_code)
+                if row is not None:
+                    result["earnings"]["forecast_summary"] = _safe_str(
+                        _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
+                    )[:200]
+                    result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
-        # Earnings quick report
-        quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
-            ("stock_yjkb_em", {}),
-        ])
-        result["errors"].extend(quick_errors)
-        if quick_df is not None:
-            row = _extract_latest_row(quick_df, stock_code)
-            if row is not None:
-                result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
-                )[:200]
-                result["source_chain"].append(f"earnings_quick:{quick_source}")
+            # Earnings quick report
+            quick_df, quick_source, quick_errors = self._call_df_candidates([
+                ("stock_yjkb_em", {"symbol": stock_code}),
+                ("stock_yjkb_em", {}),
+            ])
+            result["errors"].extend(quick_errors)
+            if quick_df is not None:
+                row = _extract_latest_row(quick_df, stock_code)
+                if row is not None:
+                    result["earnings"]["quick_report_summary"] = _safe_str(
+                        _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
+                    )[:200]
+                    result["source_chain"].append(f"earnings_quick:{quick_source}")
 
-        # Dividend details (cash dividend, pre-tax)
-        dividend_df, dividend_source, dividend_errors = self._call_df_candidates([
-            ("stock_fhps_detail_em", {"symbol": stock_code}),
-            ("stock_history_dividend_detail", {"symbol": stock_code, "indicator": "分红", "date": ""}),
-            ("stock_dividend_cninfo", {"symbol": stock_code}),
-        ])
-        result["errors"].extend(dividend_errors)
-        if dividend_df is not None:
-            dividend_payload = _build_dividend_payload(dividend_df, stock_code, max_events=5)
-            if dividend_payload:
-                result["earnings"]["dividend"] = dividend_payload
-                result["source_chain"].append(f"dividend:{dividend_source}")
+            # Dividend details (cash dividend, pre-tax)
+            dividend_df, dividend_source, dividend_errors = self._call_df_candidates([
+                ("stock_fhps_detail_em", {"symbol": stock_code}),
+                ("stock_history_dividend_detail", {"symbol": stock_code, "indicator": "分红", "date": ""}),
+                ("stock_dividend_cninfo", {"symbol": stock_code}),
+            ])
+            result["errors"].extend(dividend_errors)
+            if dividend_df is not None:
+                dividend_payload = _build_dividend_payload(dividend_df, stock_code, max_events=5)
+                if dividend_payload:
+                    result["earnings"]["dividend"] = dividend_payload
+                    result["source_chain"].append(f"dividend:{dividend_source}")
 
         # Institution / top shareholders
         inst_df, inst_source, inst_errors = self._call_df_candidates([

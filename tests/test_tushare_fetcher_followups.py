@@ -4,7 +4,7 @@
 import importlib.util
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -89,6 +89,70 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         with patch.object(fetcher, "_check_rate_limit"):
             self.assertIsNone(fetcher.get_stock_moneyflow("AAPL"))
         fetcher._api.moneyflow.assert_not_called()
+
+    def test_get_stock_financials_returns_sorted_frames(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.fina_indicator.return_value = pd.DataFrame(
+            {"end_date": ["20260630", "20260331"], "roe": [15.1, 4.2]}
+        )
+        fetcher._api.income.return_value = pd.DataFrame(
+            {"end_date": ["20260630"], "total_revenue": [1.0e9]}
+        )
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            frames = fetcher.get_stock_financials("600519")
+
+        self.assertIsNotNone(frames)
+        self.assertEqual(set(frames.keys()), {"fina_indicator", "income"})
+        self.assertEqual(list(frames["fina_indicator"]["end_date"]), ["20260331", "20260630"])
+        kwargs = fetcher._api.income.call_args.kwargs
+        self.assertEqual(kwargs["ts_code"], "600519.SH")
+        self.assertEqual(kwargs["end_date"], "20260813")
+        self.assertEqual(
+            kwargs["start_date"],
+            (datetime(2026, 8, 13) - timedelta(days=400)).strftime("%Y%m%d"),
+        )
+
+    def test_get_stock_financials_partial_failure_keeps_remaining(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.fina_indicator.side_effect = Exception("permission denied")
+        fetcher._api.income.return_value = pd.DataFrame(
+            {"end_date": ["20260630"], "total_revenue": [1.0e9]}
+        )
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            frames = fetcher.get_stock_financials("600519")
+
+        self.assertIsNotNone(frames)
+        self.assertEqual(set(frames.keys()), {"income"})
+
+    def test_get_stock_financials_all_failed_returns_none(self) -> None:
+        fetcher = self._make_fetcher()
+        for interface in ("fina_indicator", "income", "cashflow", "forecast", "express", "dividend"):
+            getattr(fetcher._api, interface).side_effect = Exception("permission denied")
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            self.assertIsNone(fetcher.get_stock_financials("600519"))
+
+    def test_get_stock_financials_unsupported_market_returns_none(self) -> None:
+        fetcher = self._make_fetcher()
+        with patch.object(fetcher, "_check_rate_limit"):
+            self.assertIsNone(fetcher.get_stock_financials("AAPL"))
+        fetcher._api.fina_indicator.assert_not_called()
+
+    def test_get_stock_financials_dividend_queries_without_date_range(self) -> None:
+        """tushare dividend 的 end_date 参数是分红年度等值过滤而非区间，必须全量拉取。"""
+        fetcher = self._make_fetcher()
+        fetcher._api.dividend.return_value = pd.DataFrame(
+            {"end_date": ["20251231"], "ex_date": ["20260626"], "cash_div_tax": [0.8]}
+        )
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            frames = fetcher.get_stock_financials("600519")
+
+        self.assertIsNotNone(frames)
+        self.assertEqual(set(frames.keys()), {"dividend"})
+        self.assertEqual(fetcher._api.dividend.call_args.kwargs, {"ts_code": "600519.SH"})
 
     def test_get_trade_time_returns_latest_trade_date_on_non_trade_day(self) -> None:
         """Non-trade day (e.g. Saturday) should return the most recent trade

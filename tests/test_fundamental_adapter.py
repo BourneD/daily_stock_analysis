@@ -18,6 +18,7 @@ from data_provider.fundamental_adapter import (
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
+    build_financial_bundle_from_tushare,
 )
 
 
@@ -69,6 +70,133 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["stock_flow"], {})
         self.assertEqual(result["source_chain"], [])
         self.assertEqual(result["status"], "not_supported")
+
+    def test_fundamental_bundle_uses_prefetched_tushare_financials(self) -> None:
+        """预取财报 payload 非空时，跳过 akshare 财报候选链，仅机构/十大股东走 akshare。"""
+        adapter = AkshareFundamentalAdapter()
+        calls = []
+
+        def _fake_call_df_candidates(candidates):
+            calls.append([name for name, _kwargs in candidates])
+            return None, None, []
+
+        prefetched = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 12.0, "net_profit_yoy": 9.5, "roe": 18.2, "gross_margin": 40.1},
+            "earnings": {
+                "financial_report": {
+                    "report_date": "2026-06-30",
+                    "revenue": 1.0e10,
+                    "net_profit_parent": 3.0e9,
+                    "operating_cash_flow": 5.0e9,
+                    "roe": 18.2,
+                }
+            },
+            "source_chain": ["growth:tushare_fina_indicator", "earnings_financial:tushare_financials"],
+            "errors": [],
+        }
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_fundamental_bundle("600519", financial_bundle=prefetched)
+
+        self.assertEqual(result["growth"], prefetched["growth"])
+        self.assertEqual(result["earnings"]["financial_report"]["revenue"], 1.0e10)
+        self.assertEqual(result["source_chain"], prefetched["source_chain"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(calls, [
+            ["stock_institute_hold", "stock_institute_recommend"],
+            ["stock_gdfx_top_10_em", "stock_gdfx_top_10_em", "stock_zh_a_gdhs_detail_em", "stock_zh_a_gdhs_detail_em"],
+        ])
+
+    def test_fundamental_bundle_prefetched_without_core_falls_back_to_akshare(self) -> None:
+        """只有预告没有核心财报时，走回完整 akshare 候选链。"""
+        adapter = AkshareFundamentalAdapter()
+        calls = []
+
+        def _fake_call_df_candidates(candidates):
+            calls.append([name for name, _kwargs in candidates])
+            return None, None, []
+
+        prefetched = {"status": "partial", "growth": {}, "earnings": {"forecast_summary": "预增"}, "source_chain": [], "errors": []}
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_fundamental_bundle("600519", financial_bundle=prefetched)
+
+        self.assertEqual(result["status"], "not_supported")
+        self.assertEqual(calls[0][0], "stock_financial_abstract")
+        self.assertEqual(len(calls), 6)
+
+    def test_build_financial_bundle_from_tushare(self) -> None:
+        """Tushare 财报原始数据映射为 akshare 口径 payload（金额单位元、分红按每股解析）。"""
+        frames = {
+            "fina_indicator": pd.DataFrame({
+                "end_date": ["20260630", "20260331"],
+                "roe": [18.2, 4.5],
+                "grossprofit_margin": [40.1, 39.0],
+                "or_yoy": [12.0, 8.0],
+                "netprofit_yoy": [9.5, 6.0],
+            }),
+            "income": pd.DataFrame({
+                "end_date": ["20260630"],
+                "total_revenue": [1.0e10],
+                "n_income_attr_p": [3.0e9],
+            }),
+            "cashflow": pd.DataFrame({
+                "end_date": ["20260630"],
+                "n_cashflow_act": [5.0e9],
+            }),
+            "forecast": pd.DataFrame({
+                "end_date": ["20261231"],
+                "type": ["预增"],
+                "summary": ["业绩大幅增长"],
+            }),
+            "express": pd.DataFrame({
+                "end_date": ["20260630"],
+                "revenue": [1.0e10],
+                "n_income": [3.0e9],
+                "yoy_net_profit": [25.5],
+                "perf_summary": ["经营稳健"],
+            }),
+            "dividend": pd.DataFrame({
+                "end_date": ["20251231"],
+                "ex_date": ["20260710"],
+                "cash_div_tax": [0.8],
+            }),
+        }
+        bundle = build_financial_bundle_from_tushare(frames, "600519")
+
+        self.assertEqual(bundle["status"], "partial")
+        self.assertEqual(bundle["growth"]["roe"], 18.2)
+        self.assertEqual(bundle["growth"]["revenue_yoy"], 12.0)
+        self.assertEqual(bundle["growth"]["gross_margin"], 40.1)
+        financial_report = bundle["earnings"]["financial_report"]
+        self.assertEqual(financial_report["report_date"], "2026-06-30")
+        self.assertEqual(financial_report["revenue"], 1.0e10)
+        self.assertEqual(financial_report["net_profit_parent"], 3.0e9)
+        self.assertEqual(financial_report["operating_cash_flow"], 5.0e9)
+        self.assertIn("预增", bundle["earnings"]["forecast_summary"])
+        self.assertIn("业绩快报", bundle["earnings"]["quick_report_summary"])
+        dividend = bundle["earnings"]["dividend"]
+        self.assertEqual(dividend["events"][0]["cash_dividend_per_share"], 0.8)
+        self.assertIn("growth:tushare_fina_indicator", bundle["source_chain"])
+        self.assertIn("earnings_financial:tushare_financials", bundle["source_chain"])
+        self.assertIn("dividend:tushare_dividend", bundle["source_chain"])
+
+    def test_build_financial_bundle_from_tushare_prefers_consolidated_rows(self) -> None:
+        """同一报告期存在母公司/合并口径时，优先取合并报表（comp_type==1）。"""
+        frames = {
+            "income": pd.DataFrame({
+                "end_date": ["20260630", "20260630"],
+                "comp_type": [4, 1],
+                "total_revenue": [5.0e9, 1.0e10],
+            }),
+        }
+        bundle = build_financial_bundle_from_tushare(frames, "600519")
+        self.assertEqual(bundle["earnings"]["financial_report"]["revenue"], 1.0e10)
+
+    def test_build_financial_bundle_from_tushare_empty_returns_not_supported(self) -> None:
+        bundle = build_financial_bundle_from_tushare({}, "600519")
+        self.assertEqual(bundle["status"], "not_supported")
+        self.assertEqual(bundle["growth"], {})
+        self.assertEqual(bundle["earnings"], {})
 
     def test_dragon_tiger_no_match_with_code_column_is_ok(self) -> None:
         adapter = AkshareFundamentalAdapter()

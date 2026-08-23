@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [改进] AIHubMix 注册与引流链接统一使用 inferera.com，改善中国大陆网络直连体验。
 - [改进] 个股资金流数据源改为 Tushare moneyflow 优先，失败或未配置时回退 akshare（东财）候选链，减少对东财接口的单点依赖。
+- [改进] 个股财报数据（财务指标/利润表/现金流/预告/快报/分红）改为 Tushare 优先，失败或未配置时回退 akshare（东财）候选链，减少对东财接口的单点依赖。
+- [修复] 基本面阶段各块按保底份额共享阶段预算（估值 50%/财报 20%/资金流 15%/龙虎榜 7.5%/板块 7.5%），修复行情源整体超时时下游块 0 预算（fundamental stage timeout）导致财务数据缺失的问题。
+- [修复] 财报/资金流块的 Tushare 预取与 akshare 尾巴拆分为独立预算，akshare 板块排行或机构接口挂起超时时保留 Tushare 数据（fail-open），不再随整块丢弃。
 
 ## [3.30.0] - 2026-08-09
 

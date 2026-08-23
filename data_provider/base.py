@@ -28,7 +28,7 @@ from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.services.market_symbol_utils import is_suffix_market_symbol
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, build_financial_bundle_from_tushare
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .realtime_types import CircuitBreaker
 
@@ -38,6 +38,40 @@ logger = logging.getLogger(__name__)
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+
+# 基本面阶段各串行子块的保底预算份额（总和为 1）。
+# 前面块最多只能消费「剩余预算 - 后续块保底份额」，行情源整体不可用时
+# 财报/资金流等下游块不会被前面块饿死（fundamental stage timeout，
+# 2026-08-13 报告财务数据缺失的直接原因）。健康日前面块快速完成，
+# 剩余预算自动顺延给后续块，保底上限不生效。
+FUNDAMENTAL_BLOCK_BUDGET_SHARES: Dict[str, float] = {
+    "valuation": 0.5,
+    "bundle": 0.2,
+    "capital_flow": 0.15,
+    "dragon_tiger": 0.075,
+    "boards": 0.075,
+}
+
+
+def _fundamental_block_timeout(
+    block: str,
+    fetch_timeout: float,
+    remaining_seconds: float,
+    stage_timeout: float,
+) -> float:
+    """计算基本面串行子块本次可用的超时预算：剩余预算扣除后续块的保底份额。"""
+    keys = list(FUNDAMENTAL_BLOCK_BUDGET_SHARES.keys())
+    reserved = 0.0
+    if block in keys:
+        reserved = stage_timeout * sum(
+            FUNDAMENTAL_BLOCK_BUDGET_SHARES[key] for key in keys[keys.index(block) + 1:]
+        )
+    return max(0.0, min(fetch_timeout, remaining_seconds - reserved))
+
+
+# Tushare 预取（财报/资金流）在块内的独立超时上限：预留时间给 akshare 尾巴，
+# 且 akshare 尾巴挂起超时时预取结果不随整块丢弃。
+FUNDAMENTAL_TUSHARE_PREFETCH_TIMEOUT_SECONDS = 3.0
 
 
 def unwrap_exception(exc: Exception) -> Exception:
@@ -2881,7 +2915,11 @@ class DataFetcherManager:
 
         # Valuation: reuse realtime quote payload — yfinance returns pe/pb in the
         # same shape as AkShare, so the existing block formatter still works.
-        valuation_timeout = min(fetch_timeout, stage_timeout) if stage_timeout > 0 else 0
+        # 估值块最多占用阶段预算一半，避免行情源不可用时吃光共享预算。
+        valuation_timeout = (
+            _fundamental_block_timeout("valuation", fetch_timeout, stage_timeout, stage_timeout)
+            if stage_timeout > 0 else 0
+        )
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -3112,6 +3150,31 @@ class DataFetcherManager:
             **blocks,
         }
 
+    def _fetch_financial_bundle_from_tushare(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        从 Tushare 预取个股财报数据，映射为与 akshare 口径一致的基本面 payload。
+
+        失败 / 无数据 / 未配置 Tushare 时返回 None，由调用方回退 akshare 候选链。
+        """
+        fetcher = self._get_fetcher_by_name("TushareFetcher")
+        if fetcher is None:
+            return None
+        get_stock_financials = getattr(fetcher, "get_stock_financials", None)
+        if not callable(get_stock_financials):
+            return None
+        try:
+            frames = get_stock_financials(stock_code)
+        except Exception as exc:
+            logger.warning("[fundamental_bundle] Tushare 财报获取失败，回退 akshare: %s", exc)
+            return None
+        if not frames:
+            return None
+        try:
+            return build_financial_bundle_from_tushare(frames, stock_code)
+        except Exception as exc:
+            logger.warning("[fundamental_bundle] Tushare 财报解析失败，回退 akshare: %s", exc)
+            return None
+
     def get_fundamental_context(
         self,
         stock_code: str,
@@ -3179,7 +3242,9 @@ class DataFetcherManager:
             nonlocal remaining_seconds
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
-        valuation_timeout = min(fetch_timeout, remaining_seconds)
+        valuation_timeout = _fundamental_block_timeout(
+            "valuation", fetch_timeout, remaining_seconds, stage_timeout
+        )
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -3214,19 +3279,45 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution (Tushare 财报优先，akshare fallback)
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
             bundle_errors = ["fundamental stage timeout"]
             bundle_ms = 0
         else:
-            bundle_timeout = min(fetch_timeout, remaining_seconds)
+            bundle_timeout = _fundamental_block_timeout(
+                "bundle", fetch_timeout, remaining_seconds, stage_timeout
+            )
+            # 第一步：Tushare 财报预取（独立小预算），失败回退 akshare 完整候选链
+            prefetch_timeout = min(bundle_timeout, FUNDAMENTAL_TUSHARE_PREFETCH_TIMEOUT_SECONDS)
+            financial_bundle, _prefetch_err, prefetch_ms = self._run_with_timeout(
+                lambda: self._fetch_financial_bundle_from_tushare(stock_code),
+                prefetch_timeout,
+                "fundamental_bundle_tushare_prefetch",
+            )
+            adapter_timeout = max(0.0, bundle_timeout - prefetch_ms / 1000.0)
+            # 第二步：adapter（预取非空时仅机构/十大股东走 akshare，否则完整 akshare 链）
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
+                lambda: self._fundamental_adapter.get_fundamental_bundle(
+                    stock_code, financial_bundle=financial_bundle
+                ),
+                adapter_timeout,
                 "fundamental_bundle",
             )
+            bundle_ms += prefetch_ms
+            tushare_meaningful = bool(
+                isinstance(financial_bundle, dict)
+                and (
+                    financial_bundle.get("growth")
+                    or (financial_bundle.get("earnings") or {}).get("financial_report")
+                )
+            )
+            if not isinstance(bundle_payload, dict) and tushare_meaningful:
+                # akshare 机构/十大股东挂起超时：保留 Tushare 财报数据，机构置空（fail-open）；
+                # 超时信息由下方 bundle_errors 统一携带，避免与 payload.errors 重复
+                bundle_payload = dict(financial_bundle)
+                bundle_payload.setdefault("institution", {})
             _consume_budget(bundle_ms)
             if not isinstance(bundle_payload, dict):
                 bundle_status = "failed"
@@ -3351,7 +3442,9 @@ class DataFetcherManager:
             )
             result_ctx["status"] = "partial"
         else:
-            capital_flow_budget = min(fetch_timeout, remaining_seconds)
+            capital_flow_budget = _fundamental_block_timeout(
+                "capital_flow", fetch_timeout, remaining_seconds, stage_timeout
+            )
             capital_flow_start = time.time()
             result_ctx["capital_flow"] = self.get_capital_flow_context(
                 stock_code,
@@ -3359,7 +3452,9 @@ class DataFetcherManager:
             )
             _consume_budget(int((time.time() - capital_flow_start) * 1000))
 
-            dragon_tiger_budget = min(fetch_timeout, remaining_seconds)
+            dragon_tiger_budget = _fundamental_block_timeout(
+                "dragon_tiger", fetch_timeout, remaining_seconds, stage_timeout
+            )
             dragon_tiger_start = time.time()
             result_ctx["dragon_tiger"] = self.get_dragon_tiger_context(
                 stock_code,
@@ -3369,7 +3464,9 @@ class DataFetcherManager:
 
             result_ctx["boards"] = self.get_board_context(
                 stock_code,
-                budget_seconds=min(fetch_timeout, remaining_seconds),
+                budget_seconds=_fundamental_block_timeout(
+                    "boards", fetch_timeout, remaining_seconds, stage_timeout
+                ),
             )
 
         block_statuses = {
@@ -3456,11 +3553,6 @@ class DataFetcherManager:
             logger.warning("[capital_flow] Tushare 个股资金流解析失败，回退 akshare: %s", exc)
             return None
 
-    def _get_capital_flow_payload(self, stock_code: str) -> Dict[str, Any]:
-        """个股资金流优先走 Tushare moneyflow，失败回退 akshare；板块排行保持 akshare fail-open。"""
-        stock_flow = self._fetch_stock_moneyflow_from_tushare(stock_code)
-        return self._fundamental_adapter.get_capital_flow(stock_code, stock_flow=stock_flow)
-
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
@@ -3483,11 +3575,31 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
+        # 第一步：Tushare 个股资金流预取（独立小预算），失败回退 akshare 完整候选链
+        prefetch_timeout = min(timeout, FUNDAMENTAL_TUSHARE_PREFETCH_TIMEOUT_SECONDS)
+        stock_flow, _prefetch_err, prefetch_ms = self._run_with_timeout(
+            lambda: self._fetch_stock_moneyflow_from_tushare(stock_code),
+            prefetch_timeout,
+            "capital_flow_tushare_prefetch",
+        )
+        adapter_timeout = max(0.0, timeout - prefetch_ms / 1000.0)
+        # 第二步：adapter（预取非空时跳过 akshare 个股候选，板块排行仍走 akshare）
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._get_capital_flow_payload(stock_code),
-            timeout,
+            lambda: self._fundamental_adapter.get_capital_flow(stock_code, stock_flow=stock_flow),
+            adapter_timeout,
             "capital_flow",
         )
+        cost_ms += prefetch_ms
+        if not isinstance(payload, dict) and isinstance(stock_flow, dict) and stock_flow:
+            # akshare 板块排行挂起超时：保留 Tushare 个股资金流，板块排行置空（fail-open）；
+            # 超时信息由块构建处的 [err] 统一携带，避免重复
+            payload = {
+                "status": "partial",
+                "stock_flow": stock_flow,
+                "sector_rankings": {"top": [], "bottom": []},
+                "source_chain": ["capital_stock:tushare_moneyflow"],
+                "errors": [] if err else ["capital_flow sector rankings timeout"],
+            }
         if not isinstance(payload, dict):
             return self._build_fundamental_block(
                 "failed",

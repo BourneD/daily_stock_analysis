@@ -3416,6 +3416,51 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
+    def _fetch_stock_moneyflow_from_tushare(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        从 Tushare moneyflow 获取个股资金流，字段与 akshare 口径对齐（金额单位：元）。
+
+        失败 / 无数据 / 未配置 Tushare 时返回 None，由调用方回退 akshare 候选链。
+        """
+        fetcher = self._get_fetcher_by_name("TushareFetcher")
+        if fetcher is None:
+            return None
+        get_stock_moneyflow = getattr(fetcher, "get_stock_moneyflow", None)
+        if not callable(get_stock_moneyflow):
+            return None
+        try:
+            df = get_stock_moneyflow(stock_code, lookback_days=10)
+        except Exception as exc:
+            logger.warning("[capital_flow] Tushare 个股资金流获取失败，回退 akshare: %s", exc)
+            return None
+        if df is None or getattr(df, "empty", True) or "net_mf_amount" not in df.columns:
+            return None
+        try:
+            work = (
+                df[["trade_date", "net_mf_amount"]]
+                .dropna(subset=["net_mf_amount"])
+                .sort_values("trade_date")
+            )
+            if work.empty:
+                return None
+            # Tushare moneyflow 金额单位为万元，转换为元以对齐 akshare 字段契约
+            latest_amount = float(pd.to_numeric(work["net_mf_amount"], errors="coerce").iloc[-1])
+            inflow_5d = float(pd.to_numeric(work["net_mf_amount"], errors="coerce").tail(5).sum())
+            inflow_10d = float(pd.to_numeric(work["net_mf_amount"], errors="coerce").tail(10).sum())
+            return {
+                "main_net_inflow": round(latest_amount * 10000, 2),
+                "inflow_5d": round(inflow_5d * 10000, 2),
+                "inflow_10d": round(inflow_10d * 10000, 2),
+            }
+        except Exception as exc:
+            logger.warning("[capital_flow] Tushare 个股资金流解析失败，回退 akshare: %s", exc)
+            return None
+
+    def _get_capital_flow_payload(self, stock_code: str) -> Dict[str, Any]:
+        """个股资金流优先走 Tushare moneyflow，失败回退 akshare；板块排行保持 akshare fail-open。"""
+        stock_flow = self._fetch_stock_moneyflow_from_tushare(stock_code)
+        return self._fundamental_adapter.get_capital_flow(stock_code, stock_flow=stock_flow)
+
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
@@ -3439,7 +3484,7 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._get_capital_flow_payload(stock_code),
             timeout,
             "capital_flow",
         )

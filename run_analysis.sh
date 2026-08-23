@@ -6,7 +6,7 @@ source /root/venv/python_3_13/bin/activate
 
 # rm -f /root/daily_stock_analysis/reports/*
 
-python main.py
+python main.py --force-run
 
 cp /root/daily_stock_analysis/reports/* /root/stock_analysis_report/reports/
 

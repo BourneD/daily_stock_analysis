@@ -44,6 +44,32 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["值"], 1)
 
+    def test_capital_flow_uses_prefetched_stock_flow_and_skips_akshare_stock_candidates(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        calls = []
+
+        def _fake_call_df_candidates(candidates):
+            calls.append([name for name, _kwargs in candidates])
+            return None, None, []
+
+        prefetched = {"main_net_inflow": 12345.0, "inflow_5d": -2000.0, "inflow_10d": 500.0}
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_capital_flow("600519", stock_flow=prefetched)
+
+        self.assertEqual(result["stock_flow"], prefetched)
+        self.assertEqual(result["source_chain"], ["capital_stock:tushare_moneyflow"])
+        self.assertEqual(result["status"], "partial")
+        # 只调用板块排行候选，不再尝试 akshare 个股资金流
+        self.assertEqual(calls, [["stock_sector_fund_flow_rank", "stock_sector_fund_flow_summary"]])
+
+    def test_capital_flow_empty_prefetched_falls_back_to_akshare_candidates(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        with patch.object(adapter, "_call_df_candidates", return_value=(None, None, [])):
+            result = adapter.get_capital_flow("600519", stock_flow={})
+        self.assertEqual(result["stock_flow"], {})
+        self.assertEqual(result["source_chain"], [])
+        self.assertEqual(result["status"], "not_supported")
+
     def test_dragon_tiger_no_match_with_code_column_is_ok(self) -> None:
         adapter = AkshareFundamentalAdapter()
         df = pd.DataFrame(

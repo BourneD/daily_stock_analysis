@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.base import DataFetcherManager
 
+import pandas as pd
+
 
 class _DummyFetcher:
     def __init__(self, name: str, priority: int, rankings=None):
@@ -26,6 +28,19 @@ class _DummyFetcher:
 
     def get_sector_rankings(self, _n: int = 5):
         return self._rankings
+
+
+class _DummyTushareMoneyflowFetcher:
+    def __init__(self, df=None, exc=None):
+        self.name = "TushareFetcher"
+        self.priority = -1
+        self._df = df
+        self._exc = exc
+
+    def get_stock_moneyflow(self, _stock_code: str, lookback_days: int = 10):
+        if self._exc is not None:
+            raise self._exc
+        return self._df
 
 
 class _DummyBoardFetcher:
@@ -503,6 +518,7 @@ class TestFundamentalContext(unittest.TestCase):
             fundamental_retry_max=1,
         )
         with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "_fetch_stock_moneyflow_from_tushare", return_value=None), \
                 patch(
                     "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
                     return_value={
@@ -515,6 +531,76 @@ class TestFundamentalContext(unittest.TestCase):
                 ):
             ctx = manager.get_capital_flow_context("600519", budget_seconds=0.5)
         self.assertEqual(ctx["status"], "not_supported")
+
+    def _capital_flow_context_cfg(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=0,
+            fundamental_stage_timeout_seconds=2.0,
+            fundamental_fetch_timeout_seconds=1.5,
+            fundamental_retry_max=1,
+        )
+
+    def test_capital_flow_context_prefers_tushare_moneyflow(self) -> None:
+        """Tushare moneyflow 可用时优先使用，金额由万元转为元，5日/10日为滚动求和。"""
+        df = pd.DataFrame(
+            {
+                "trade_date": ["20260810", "20260811", "20260812", "20260813"],
+                "net_mf_amount": [1.0, 2.0, 3.0, 4.0],  # 万元
+            }
+        )
+        manager = DataFetcherManager(fetchers=[_DummyTushareMoneyflowFetcher(df=df)])
+        captured = {}
+
+        def _adapter_side_effect(_code, stock_flow=None):
+            captured["stock_flow"] = stock_flow
+            return {
+                "status": "ok" if stock_flow else "not_supported",
+                "stock_flow": stock_flow or {},
+                "sector_rankings": {"top": [], "bottom": []},
+                "source_chain": ["capital_stock:tushare_moneyflow"] if stock_flow else [],
+                "errors": [],
+            }
+
+        with patch("src.config.get_config", return_value=self._capital_flow_context_cfg()), \
+                patch.object(manager._fundamental_adapter, "get_capital_flow", side_effect=_adapter_side_effect):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=1.0)
+        self.assertEqual(ctx["status"], "ok")
+        self.assertEqual(captured["stock_flow"], {
+            "main_net_inflow": 40000.0,
+            "inflow_5d": 100000.0,
+            "inflow_10d": 100000.0,
+        })
+
+    def test_capital_flow_context_falls_back_when_tushare_fails(self) -> None:
+        """Tushare 抛错 / 返回空 / 未配置时，回退 akshare 候选链（stock_flow=None）。"""
+        cases = [
+            ("raise", _DummyTushareMoneyflowFetcher(exc=RuntimeError("boom"))),
+            ("empty", _DummyTushareMoneyflowFetcher(df=pd.DataFrame())),
+            # 非空 fetcher 列表跳过默认数据源初始化，模拟未配置 Tushare 的场景
+            ("no_fetcher", _DummyFetcher("EfinanceFetcher", 0)),
+        ]
+        for label, fetcher in cases:
+            with self.subTest(case=label):
+                manager = DataFetcherManager(fetchers=[fetcher])
+                captured = {}
+
+                def _adapter_side_effect(_code, stock_flow=None):
+                    captured["stock_flow"] = stock_flow
+                    return {
+                        "status": "not_supported",
+                        "stock_flow": {},
+                        "sector_rankings": {"top": [], "bottom": []},
+                        "source_chain": [],
+                        "errors": [],
+                    }
+
+                with patch("src.config.get_config", return_value=self._capital_flow_context_cfg()), \
+                        patch.object(manager._fundamental_adapter, "get_capital_flow",
+                                     side_effect=_adapter_side_effect):
+                    ctx = manager.get_capital_flow_context("600519", budget_seconds=1.0)
+                self.assertIsNone(captured["stock_flow"])
+                self.assertEqual(ctx["status"], "not_supported")
 
     def test_get_belong_boards_from_capability_probe(self) -> None:
         fetcher = _DummyBoardFetcher(

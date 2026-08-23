@@ -57,6 +57,39 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
 
         self.assertEqual(fetcher._api.trade_cal.call_count, 2)
         self.assertEqual(rate_limit_mock.call_count, 2)
+
+    def test_get_stock_moneyflow_sorts_by_trade_date(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.moneyflow.return_value = pd.DataFrame(
+            {
+                "trade_date": ["20260813", "20260811"],
+                "net_mf_amount": [100.0, 50.0],
+            }
+        )
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            df = fetcher.get_stock_moneyflow("600519")
+
+        self.assertIsNotNone(df)
+        self.assertEqual(list(df["trade_date"]), ["20260811", "20260813"])
+        kwargs = fetcher._api.moneyflow.call_args.kwargs
+        self.assertEqual(kwargs["ts_code"], "600519.SH")
+        self.assertEqual(kwargs["start_date"], "20260724")
+        self.assertEqual(kwargs["end_date"], "20260813")
+
+    def test_get_stock_moneyflow_empty_returns_none(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.moneyflow.return_value = pd.DataFrame()
+        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 8, 13, 20, 0)), \
+                patch.object(fetcher, "_check_rate_limit"):
+            self.assertIsNone(fetcher.get_stock_moneyflow("600519"))
+
+    def test_get_stock_moneyflow_unsupported_market_returns_none(self) -> None:
+        fetcher = self._make_fetcher()
+        with patch.object(fetcher, "_check_rate_limit"):
+            self.assertIsNone(fetcher.get_stock_moneyflow("AAPL"))
+        fetcher._api.moneyflow.assert_not_called()
+
     def test_get_trade_time_returns_latest_trade_date_on_non_trade_day(self) -> None:
         """Non-trade day (e.g. Saturday) should return the most recent trade
         date (Friday), not the one before it (Thursday).  Fixes #1009."""

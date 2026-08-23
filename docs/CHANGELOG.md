@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [改进] AIHubMix 注册与引流链接统一使用 inferera.com，改善中国大陆网络直连体验。
+- [改进] 个股资金流数据源改为 Tushare moneyflow 优先，失败或未配置时回退 akshare（东财）候选链，减少对东财接口的单点依赖。
 
 ## [3.30.0] - 2026-08-09
 

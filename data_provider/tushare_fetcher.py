@@ -1146,10 +1146,40 @@ class TushareFetcher(BaseFetcher):
         
         # 获取为空或者接口调用失败，返回 None
         return None
-    
-    
 
-    
+    def get_stock_moneyflow(self, stock_code: str, lookback_days: int = 10) -> Optional[pd.DataFrame]:
+        """
+        获取个股资金流向数据 (ts.pro_api().moneyflow)
+
+        数据字段包含 trade_date、net_mf_amount（主力净流入额，单位：万元）等。
+        返回按 trade_date 升序的 DataFrame；接口需要 2000 积分以上。
+
+        仅支持 A 股个股；美股/港股返回 None（由调用方回退其他数据源）。
+
+        Args:
+            stock_code: 股票代码，如 '600519'、'000001'
+            lookback_days: 向前拉取的交易日数（按自然日放大以覆盖周末/节假日）
+
+        Returns:
+            DataFrame（含 trade_date、net_mf_amount 等列），无数据返回 None
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        if _is_us_code(stock_code) or _is_hk_market(stock_code):
+            return None
+
+        ts_code = self._convert_stock_code(stock_code)
+        china_now = self._get_china_now()
+        ts_end = china_now.strftime("%Y%m%d")
+        ts_start = (china_now - timedelta(days=lookback_days * 2)).strftime("%Y%m%d")
+
+        logger.debug(f"调用 Tushare moneyflow({ts_code}, {ts_start}, {ts_end})")
+        df = self._call_api_with_rate_limit("moneyflow", ts_code=ts_code, start_date=ts_start, end_date=ts_end)
+        if df is None or df.empty:
+            return None
+        return df.sort_values("trade_date").reset_index(drop=True)
+
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据
